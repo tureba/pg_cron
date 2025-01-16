@@ -329,7 +329,7 @@ _PG_init(void)
 
 	/* set up common data for all our workers */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = 1;
 #if (PG_VERSION_NUM < 100000)
 	worker.bgw_main = PgCronLauncherMain;
@@ -1316,7 +1316,17 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			RunningTaskCount++;
 
 			/* Add new entry to audit table. */
-			task->runId = NextRunId();
+			if (!RecoveryInProgress())
+			{
+				/*
+				 * runId gets the nextval of a sequence and is only
+				 * used to log details, none of which are necessary
+				 * in standbys.
+				 * Both InsertJobRunDetail and UpdateJobRunDetail will
+				 * return quickly without using runId when in recovery.
+				 */
+				task->runId = NextRunId();
+			}
 			if (CronLogRun)
 				InsertJobRunDetail(task->runId, &cronJob->jobId,
 										cronJob->database,

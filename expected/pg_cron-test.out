@@ -24,7 +24,8 @@ SELECT cron.unschedule('testjob');
 -- Test cache invalidation
 DROP EXTENSION pg_cron;
 CREATE EXTENSION pg_cron VERSION '1.4';
-ALTER EXTENSION pg_cron UPDATE;
+-- Test binary compatibility with v1.6 function signature.
+ALTER EXTENSION pg_cron UPDATE TO '1.6';
 -- Vacuum every day at 10:00am (GMT)
 SELECT cron.schedule('0 10 * * *', 'VACUUM');
  schedule 
@@ -248,6 +249,48 @@ SELECT username FROM cron.job where jobid=7;
    username   
 --------------
  pgcron_cront
+(1 row)
+
+-- Test function overloading between v1.6 and v1.7 function signatures.
+-- v1.7 has all parameters without default expressions in order to avoid conflicts
+ALTER EXTENSION pg_cron UPDATE;
+-- Create a job
+SELECT cron.schedule('schedule-v1.6', '0 11 * * *', 'SELECT 1.6');
+ schedule 
+----------
+        8
+(1 row)
+
+SELECT cron.schedule('schedule-v1.7', '0 11 * * *', 'SELECT 1.7', scope:='both');
+ schedule 
+----------
+        9
+(1 row)
+
+-- Create a job for another user
+SELECT cron.schedule_in_database(job_name:='schedule_in_database-v1.6', schedule:='0 11 * * *', command:='SELECT 1.6', database:=current_database());
+ schedule_in_database 
+----------------------
+                   10
+(1 row)
+
+SELECT cron.schedule_in_database(job_name:='schedule_in_database-v1.7', schedule:='0 11 * * *', command:='SELECT 1.6', database:=current_database(), username:=current_user, active:=true, scope:='both');
+ schedule_in_database 
+----------------------
+                   11
+(1 row)
+
+-- Update a job
+select cron.alter_job(job_id:=8, database:=current_database());
+ alter_job 
+-----------
+ 
+(1 row)
+
+select cron.alter_job(job_id:=9, schedule:=null, command:=null, database:=current_database(), username:=null, active:=true, scope:='both');
+ alter_job 
+-----------
+ 
 (1 row)
 
 -- Override function

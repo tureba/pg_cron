@@ -76,7 +76,8 @@ static HTAB * CreateCronJobHash(void);
 
 static int64 ScheduleCronJob(text *scheduleText, text *commandText,
 								text *databaseText, text *usernameText,
-								bool active, text *jobnameText);
+								bool active, text *jobnameText,
+								text *scopeText);
 static Oid CronExtensionOwner(void);
 static void EnsureDeletePermission(Relation cronJobsTable, HeapTuple heapTuple);
 static void InvalidateJobCache(void);
@@ -88,7 +89,8 @@ static bool JobRunDetailsTableExists(void);
 static bool JobTableExists(void);
 
 static void AlterJob(int64 jobId, text *scheduleText, text *commandText,
-						text *databaseText, text *usernameText, bool *active);
+						text *databaseText, text *usernameText, bool *active,
+						text *scopeText);
 
 static Oid GetRoleOidIfCanLogin(char *username);
 static entry * ParseSchedule(char *scheduleText);
@@ -186,7 +188,8 @@ GetCronJob(int64 jobId)
  */
 static int64
 ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
-					text *usernameText, bool active, text *jobnameText)
+					text *usernameText, bool active, text *jobnameText,
+					text *scopeText)
 {
 	entry *parsedSchedule = NULL;
 	char *schedule;
@@ -194,6 +197,7 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	char *database_name;
 	char *jobName;
 	char *username;
+	char *scope;
 	AclResult aclresult;
 	Oid userIdcheckacl;
 
@@ -201,8 +205,8 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	Datum jobIdDatum = 0;
 
 	StringInfoData querybuf;
-	Oid argTypes[8];
-	Datum argValues[8];
+	Oid argTypes[9];
+	Datum argValues[9];
 	int argCount = 0;
 
 	Oid savedUserId = InvalidOid;
@@ -230,11 +234,21 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 
 	free_entry(parsedSchedule);
 
+	if (scopeText != NULL)
+	{
+		scope = text_to_cstring(scopeText);
+	}
+
 	initStringInfo(&querybuf);
 
 	appendStringInfo(&querybuf,
 		"insert into %s (schedule, command, nodename, nodeport, database, username, active",
 		quote_qualified_identifier(CRON_SCHEMA_NAME, JOBS_TABLE_NAME));
+
+	if (scopeText != NULL)
+	{
+		appendStringInfo(&querybuf, ", scope");
+	}
 
 	if (jobnameText != NULL)
 	{
@@ -243,9 +257,21 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 
 	appendStringInfo(&querybuf, ") values ($1, $2, $3, $4, $5, $6, $7");
 
+	if (scopeText != NULL)
+	{
+		appendStringInfo(&querybuf, ", $8");
+	}
+
 	if (jobnameText != NULL)
 	{
-		appendStringInfo(&querybuf, ", $8) ");
+		if (scopeText != NULL)
+		{
+			appendStringInfo(&querybuf, ", $9) ");
+		}
+		else
+		{
+			appendStringInfo(&querybuf, ", $8) ");
+		}
 		appendStringInfo(&querybuf, "on conflict on constraint jobname_username_uniq ");
 		appendStringInfo(&querybuf, "do update set ");
 		appendStringInfo(&querybuf, "schedule = EXCLUDED.schedule, ");
@@ -328,11 +354,18 @@ ScheduleCronJob(text *scheduleText, text *commandText, text *databaseText,
 	argValues[6] = BoolGetDatum(active);
 	argCount++;
 
-	if (jobnameText != NULL)
+	if (scopeText != NULL)
 	{
 		argTypes[7] = TEXTOID;
+		argValues[7] = CStringGetTextDatum(scope);
+		argCount++;
+	}
+
+	if (jobnameText != NULL)
+	{
+		argTypes[argCount] = TEXTOID;
 		jobName = text_to_cstring(jobnameText);
-		argValues[7] = CStringGetTextDatum(jobName);
+		argValues[argCount] = CStringGetTextDatum(jobName);
 		argCount++;
 	}
 
@@ -420,6 +453,7 @@ cron_alter_job(PG_FUNCTION_ARGS)
 	text *commandText = NULL;
 	text *databaseText = NULL;
 	text *usernameText = NULL;
+	text *scopeText = NULL;
 	bool active;
 
 	if (PG_ARGISNULL(0))
@@ -442,8 +476,11 @@ cron_alter_job(PG_FUNCTION_ARGS)
 	if (!PG_ARGISNULL(5))
 		active = PG_GETARG_BOOL(5);
 
+	if (!PG_ARGISNULL(6))
+		scopeText = PG_GETARG_TEXT_P(6);
+
 	AlterJob(jobId, scheduleText, commandText, databaseText, usernameText,
-				PG_ARGISNULL(5) ? NULL : &active);
+				PG_ARGISNULL(5) ? NULL : &active, scopeText);
 
 	PG_RETURN_VOID();
 }
@@ -470,7 +507,7 @@ cron_schedule(PG_FUNCTION_ARGS)
 		commandText = PG_GETARG_TEXT_P(1);
 
 	jobId = ScheduleCronJob(scheduleText, commandText, NULL,
-							NULL, true, NULL);
+							NULL, true, NULL, NULL);
 
 	PG_RETURN_INT64(jobId);
 }
@@ -487,6 +524,7 @@ cron_schedule_named(PG_FUNCTION_ARGS)
 	text *usernameText = NULL;
 	bool active = true;
 	text *jobnameText = NULL;
+	text *scopeText = NULL;
 	int64 jobId;
 
 	if (PG_ARGISNULL(0))
@@ -504,20 +542,42 @@ cron_schedule_named(PG_FUNCTION_ARGS)
 	else
 		commandText = PG_GETARG_TEXT_P(2);
 
-	if (PG_NARGS() > 3)
-	{
-		if (!PG_ARGISNULL(3))
-			databaseText = PG_GETARG_TEXT_P(3);
+	switch(PG_NARGS()) {
+		/* v1.7: schedule(job_name, schedule, command, scope) */
+		case 4:
+			if (!PG_ARGISNULL(3))
+				scopeText = PG_GETARG_TEXT_P(3);
+			/* fallthrough */
 
-		if (!PG_ARGISNULL(4))
-			usernameText = PG_GETARG_TEXT_P(4);
+		/* v1.6: schedule(job_name, schedule, command) */
+		case 3:
+			break;
 
-		if (!PG_ARGISNULL(5))
-			active = PG_GETARG_BOOL(5);
+		/* v1.7: schedule_in_database(job_name, schedule, command, database, username, active, scope) */
+		case 7:
+			if (!PG_ARGISNULL(6))
+				scopeText = PG_GETARG_TEXT_P(6);
+			/* fallthrough */
+
+		/* v1.6: schedule_in_database(job_name, schedule, command, database, username, active) */
+		case 6:
+			if (!PG_ARGISNULL(3))
+				databaseText = PG_GETARG_TEXT_P(3);
+
+			if (!PG_ARGISNULL(4))
+				usernameText = PG_GETARG_TEXT_P(4);
+
+			if (!PG_ARGISNULL(5))
+				active = PG_GETARG_BOOL(5);
+			break;
+
+		default:
+			Assert(false);
 	}
 
 	jobId = ScheduleCronJob(scheduleText, commandText, databaseText,
-							usernameText, active, jobnameText);
+							usernameText, active, jobnameText,
+							scopeText);
 
 	PG_RETURN_INT64(jobId);
 }
@@ -867,11 +927,10 @@ LoadCronJobList(void)
 	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/*
-	 * If the pg_cron extension has not been created yet or
-	 * we are on a hot standby, the job table is treated as
-	 * being empty.
+	 * If the pg_cron extension has not been created yet,
+	 * the job table is treated as being empty.
 	 */
-	if (!PgCronHasBeenLoaded() || RecoveryInProgress())
+	if (!PgCronHasBeenLoaded())
 	{
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -899,7 +958,12 @@ LoadCronJobList(void)
 		job = TupleToCronJob(tupleDescriptor, heapTuple);
 		if (job != NULL)
 		{
-			jobList = lappend(jobList, job);
+			/* only add jobs that should run on the current scope */
+			if (!((strcmp(job->scope, "primary") == 0 && RecoveryInProgress()) ||
+			   (strcmp(job->scope, "standby") == 0 && !RecoveryInProgress())))
+			{
+				jobList = lappend(jobList, job);
+			}
 		}
 
 		MemoryContextSwitchTo(oldContext);
@@ -946,6 +1010,8 @@ TupleToCronJob(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 	Datum database = heap_getattr(heapTuple, Anum_cron_job_database,
 								  tupleDescriptor, &isNull);
 	Datum userName = heap_getattr(heapTuple, Anum_cron_job_username,
+								  tupleDescriptor, &isNull);
+	Datum scope = heap_getattr(heapTuple, Anum_cron_job_scope,
 								  tupleDescriptor, &isNull);
 
 	jobOwner = TextDatumGetCString(userName);
@@ -1008,6 +1074,15 @@ TupleToCronJob(TupleDesc tupleDescriptor, HeapTuple heapTuple)
 		{
 			job->jobName = NULL;
 		}
+	}
+
+	if (tupleDescriptor->natts >= Anum_cron_job_scope)
+	{
+		job->scope = TextDatumGetCString(scope);
+	}
+	else
+	{
+		job->scope = NULL;
 	}
 
 	parsedSchedule = ParseSchedule(job->scheduleText);
@@ -1238,7 +1313,7 @@ UpdateJobRunDetail(int64 runId, int32 *job_pid, char *status, char *return_messa
 
 
 static void
-AlterJob(int64 jobId, text *scheduleText, text *commandText, text *databaseText, text *usernameText, bool *active)
+AlterJob(int64 jobId, text *scheduleText, text *commandText, text *databaseText, text *usernameText, bool *active, text *scopeText)
 {
 	StringInfoData querybuf;
 	Oid argTypes[7];
@@ -1254,6 +1329,7 @@ AlterJob(int64 jobId, text *scheduleText, text *commandText, text *databaseText,
 	char *command;
 	char *username;
 	char *currentuser;
+	char *scope;
 	entry *parsedSchedule = NULL;
 
 	userId = GetUserId();
@@ -1365,6 +1441,15 @@ AlterJob(int64 jobId, text *scheduleText, text *commandText, text *databaseText,
 		argValues[i] = BoolGetDatum(*active);
 		i++;
 		appendStringInfo(&querybuf, " active = $%d,", i);
+	}
+
+	if (scopeText != NULL)
+	{
+		argTypes[i] = TEXTOID;
+		scope = text_to_cstring(scopeText);
+		argValues[i] = CStringGetTextDatum(scope);
+		i++;
+		appendStringInfo(&querybuf, " scope = $%d,", i);
 	}
 
 	/* remove the last comma */

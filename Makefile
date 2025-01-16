@@ -8,6 +8,8 @@ DATA = $(wildcard $(EXTENSION)--*--*.sql)
 REGRESS_OPTS =--temp-config=./pg_cron.conf --temp-instance=./tmp_check
 REGRESS = pg_cron-test 
 
+TAP_TESTS = 1
+
 # compilation configuration
 MODULE_big = $(EXTENSION)
 OBJS = $(patsubst %.c,%.o,$(wildcard src/*.c))

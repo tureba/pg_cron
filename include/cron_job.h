@@ -28,6 +28,7 @@ typedef struct FormData_cron_job
 	text userName;
 	bool active;
 	text jobName;
+	text scope;
 #endif
 } FormData_cron_job;
 
@@ -52,6 +53,7 @@ typedef FormData_cron_job *Form_cron_job;
 #define Anum_cron_job_username 7
 #define Anum_cron_job_active 8
 #define Anum_cron_job_jobname 9
+#define Anum_cron_job_scope 10
 
 typedef struct FormData_job_run_details
 {
